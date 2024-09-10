@@ -1,8 +1,8 @@
-/*
+//*
  *  This is a simple shell program from
  *  rik0.altervista.org/snippetss/csimpleshell.html
  *  It's been modified a bit and comments were added.
- *
+ * 
  *  But it doesn't allow misdirection, e.g., <, >, >>, or |
  *  The project is to fix this.
  */
