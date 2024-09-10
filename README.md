@@ -42,4 +42,4 @@ Given an input like `cat <file name> | grep and | hexdump -x`, the shell should:
 To test the shell, you can use the following command:
 
 ```bash
-cat almamater | grep and | grep her | hexdump -
+cat almamater | grep and | grep her | hexdump - x
