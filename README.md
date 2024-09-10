@@ -1,5 +1,5 @@
 # EE 468 Project: Simple Shell with Pipes
-
+![Alt Text](https://ieeexplore.ieee.org/mediastore/IEEE/content/freeimages/90/5484926/5451126/5451126-photo-2-source-small.gif)
 ## Overview
 
 This project involves modifying a simple shell program to support command pipelining using pipes (`|`). The initial version of the shell, provided in the `sshell.c` file, does not handle redirection or pipes. Your task is to enhance this shell to handle pipes, enabling it to execute a sequence of commands where the output of one command becomes the input of the next.
