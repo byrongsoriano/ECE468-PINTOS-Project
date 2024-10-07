@@ -1,14 +1,4 @@
-//////////////////////////////////////////////////////////////////////////////////////
-///         University of Hawaii - College of Engineering
-///                       Amanda Eckardt
-///                     ECE 468 Fall 2024
-///
-///                     Pintos Progect B
-/// 
-///                How many threads was it again?
-///
-///@brief:  
-//////////////////////////////////////////////////////////////////////////////////////
+
 #ifndef THREADS_THREAD_H
 #define THREADS_THREAD_H
 
