@@ -1,14 +1,4 @@
-//////////////////////////////////////////////////////////////////////////////////////
-///         University of Hawaii - College of Engineering
-///                       Amanda Eckardt
-///                     ECE 468 Fall 2024
-///
-///                     Pintos Progect B
-/// 
-///                 One thread, two threads,...
-///
-///@brief:  
-//////////////////////////////////////////////////////////////////////////////////////
+
 #include "threads/thread.h"
 #include <debug.h>
 #include <stddef.h>
