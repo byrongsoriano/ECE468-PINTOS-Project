@@ -1,15 +1,4 @@
-//////////////////////////////////////////////////////////////////////////////////////
-///         University of Hawaii - College of Engineering
-///                       Amanda Eckardt
-///                     ECE 468 Fall 2024
-///
-///                     Pintos Progect B
-/// 
-///                 Caller ID: You're Face
-///
-///@brief:
-///@see:  https://casys-kaist.github.io/pintos-kaist/project2/system_call.html   
-//////////////////////////////////////////////////////////////////////////////////////
+
 #include "userprog/syscall.h"
 #include <stdio.h>
 #include <string.h>
