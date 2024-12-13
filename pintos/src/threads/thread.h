@@ -2,12 +2,10 @@
 #define THREADS_THREAD_H
 
 #include <debug.h>
+#include <hash.h>
 #include <list.h>
 #include <stdint.h>
-#include <kernel/list.h>
-#include "fixed_point.h"
-
-#include <threads/synch.h>
+#include "threads/synch.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -28,58 +26,55 @@ typedef int tid_t;
 #define PRI_DEFAULT 31 /* Default priority. */
 #define PRI_MAX 63     /* Highest priority. */
 
-/* ++ 2 */
-struct lock filesys_lock;    // a global lock on filesystem operations, to ensure thread safety.
-#define INIT_EXIT_STAT -2333 /* A kernel thread or user process.    \
-                                                                  \ \
-/*                                                                  \
-   Each thread structure is stored in its own 4 kB page.  The       \
-   thread structure itself sits at the very bottom of the page      \
-   (at offset 0).  The rest of the page is reserved for the         \
-   thread's kernel stack, which grows downward from the top of      \
-   the page (at offset 4 kB).  Here's an illustration:              \
-                                                                  \ \
-        4 kB +---------------------------------+                    \
-             |          kernel stack           |                    \
-             |                |                |                    \
-             |                |                |                    \
-             |                V                |                    \
-             |         grows downward          |                    \
-             |                                 |                    \
-             |                                 |                    \
-             |                                 |                    \
-             |                                 |                    \
-             |                                 |                    \
-             |                                 |                    \
-             |                                 |                    \
-             |                                 |                    \
-             +---------------------------------+                    \
-             |              magic              |                    \
-             |                :                |                    \
-             |                :                |                    \
-             |               name              |                    \
-             |              status             |                    \
-        0 kB +---------------------------------+                    \
-                                                                  \ \
-   The upshot of this is twofold:                                   \
-                                                                  \ \
-      1. First, `struct thread' must not be allowed to grow too     \
-         big.  If it does, then there will not be enough room for   \
-         the kernel stack.  Our base `struct thread' is only a      \
-         few bytes in size.  It probably should stay well under 1   \
-         kB.                                                        \
-                                                                  \ \
-      2. Second, kernel stacks must not be allowed to grow too      \
-         large.  If a stack overflows, it will corrupt the thread   \
-         state.  Thus, kernel functions should not allocate large   \
-         structures or arrays as non-static local variables.  Use   \
-         dynamic allocation with malloc() or palloc_get_page()      \
-         instead.                                                   \
-                                                                  \ \
-   The first symptom of either of these problems will probably be   \
-   an assertion failure in thread_current(), which checks that      \
-   the `magic' member of the running thread's `struct thread' is    \
-   set to THREAD_MAGIC.  Stack overflow will normally change this   \
+/* A kernel thread or user process.
+
+   Each thread structure is stored in its own 4 kB page.  The
+   thread structure itself sits at the very bottom of the page
+   (at offset 0).  The rest of the page is reserved for the
+   thread's kernel stack, which grows downward from the top of
+   the page (at offset 4 kB).  Here's an illustration:
+
+        4 kB +---------------------------------+
+             |          kernel stack           |
+             |                |                |
+             |                |                |
+             |                V                |
+             |         grows downward          |
+             |                                 |
+             |                                 |
+             |                                 |
+             |                                 |
+             |                                 |
+             |                                 |
+             |                                 |
+             |                                 |
+             +---------------------------------+
+             |              magic              |
+             |                :                |
+             |                :                |
+             |               name              |
+             |              status             |
+        0 kB +---------------------------------+
+
+   The upshot of this is twofold:
+
+      1. First, `struct thread' must not be allowed to grow too
+         big.  If it does, then there will not be enough room for
+         the kernel stack.  Our base `struct thread' is only a
+         few bytes in size.  It probably should stay well under 1
+         kB.
+
+      2. Second, kernel stacks must not be allowed to grow too
+         large.  If a stack overflows, it will corrupt the thread
+         state.  Thus, kernel functions should not allocate large
+         structures or arrays as non-static local variables.  Use
+         dynamic allocation with malloc() or palloc_get_page()
+         instead.
+
+   The first symptom of either of these problems will probably be
+   an assertion failure in thread_current(), which checks that
+   the `magic' member of the running thread's `struct thread' is
+   set to THREAD_MAGIC.  Stack overflow will normally change this
    value, triggering the assertion. */
 /* The `elem' member has a dual purpose.  It can be an element in
    the run queue (thread.c), or it can be an element in a
@@ -97,54 +92,49 @@ struct thread
    int priority;              /* Priority. */
    struct list_elem allelem;  /* List element for all threads list. */
 
+   /* Owned by process.c. */
+   int exit_code;                   /* Exit code. */
+   struct wait_status *wait_status; /* This process's completion status. */
+   struct list children;            /* Completion status of children. */
+
    /* Shared between thread.c and synch.c. */
-   struct list_elem elem;  /* List element. */
-   uint64_t blocked_ticks; /* ++ Blocked ticks. */
+   struct list_elem elem; /* List element. */
 
-   /* ++1.2 1     */
-   int base_priority;         /* Base priority. */
-   struct list locks;         /* Locks that the thread is holding. */
-   struct lock *lock_waiting; /* The lock that the thread is waiting for. */
+   /* Alarm clock. */
+   int64_t wakeup_time;         /* Time to wake this thread up. */
+   struct list_elem timer_elem; /* Element in timer_wait_list. */
+   struct semaphore timer_sema; /* Semaphore. */
 
-   /* ++1.3 Nice */
-   int nice; /* Niceness. */
-   fixed_t recent_cpu;
-
-   /* ++ 2 */
-   int64_t waketick;
-   bool load_success;          // if the child process is loaded successfully
-   struct semaphore load_sema; // semaphore to keep the thread waiting until it makes sure whether the child process if successfully loaded.
-   int exit_status;
-   struct list children_list;
-   struct thread *parent;
-   struct file *self;        // its executable file
-   struct list opened_files; // all the opened files
-   int fd_count;
-   // struct semaphore child_lock;
-   struct child_process *waiting_child; // pid of the child process it is currently waiting
-
-#ifdef USERPROG
    /* Owned by userprog/process.c. */
-   uint32_t *pagedir; /* Page directory. */
-#endif
+   uint32_t *pagedir;     /* Page directory. */
+   struct hash *pages;    /* Page table. */
+   struct file *bin_file; /* The binary executable. */
+
+   /* Owned by syscall.c. */
+   struct list fds;      /* List of file descriptors. */
+   struct list mappings; /* Memory-mapped files. */
+   int next_handle;      /* Next handle value. */
+   void *user_esp;       /* User's stack pointer. */
 
    /* Owned by thread.c. */
    unsigned magic; /* Detects stack overflow. */
 };
 
-/* ++ 2 */
-struct child_process
+/* Tracks the completion of a process.
+   Reference held by both the parent, in its `children' list,
+   and by the child, in its `wait_status' pointer. */
+struct wait_status
 {
-   int tid;
-   struct list_elem child_elem; // element of itself point to its parent's child_list
-   int exit_status;             // store its exit status to pass it to its parent
-
-   /*whether the child process has been waited()
-   according to the document: a process may wait for any given child at most once.
-   if_waited would be initialized to false*/
-   bool if_waited;
-   struct semaphore wait_sema;
+   struct list_elem elem; /* `children' list element. */
+   struct lock lock;      /* Protects ref_cnt. */
+   int ref_cnt;           /* 2=child and parent both alive,
+                             1=either child or parent alive,
+                             0=child and parent both dead. */
+   tid_t tid;             /* Child thread id. */
+   int exit_code;         /* Child exit code, if dead. */
+   struct semaphore dead; /* 1=child alive, 0=child dead. */
 };
+
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
    Controlled by kernel command-line option "-o mlfqs". */
@@ -181,26 +171,4 @@ void thread_set_nice(int);
 int thread_get_recent_cpu(void);
 int thread_get_load_avg(void);
 
-void thread_check_blocked(struct thread *, void *aux UNUSED);
-
-/* +++1.2 */
-bool compare_priority(const struct list_elem *, const struct list_elem *, void *);
-void thread_update_priority(struct thread *);
-bool lock_cmp_priority(const struct list_elem *, const struct list_elem *, void *);
-void thread_remove_lock(struct lock *);
-void thread_donate_priority(struct thread *);
-void thread_hold_the_lock(struct lock *);
-
-/* ++1.3 mlfqs */
-void thread_mlfqs_update_priority(struct thread *);
-void thread_mlfqs_update_load_avg_and_recent_cpu(void);
-void thread_mlfqs_increase_recent_cpu_by_one(void);
-
-/* ++ 2 */
-bool cmp_waketick(struct list_elem *first, struct list_elem *second, void *aux);
-
 #endif /* threads/thread.h */
-/* ++ 2 */
-#ifdef USERPROG
-struct list_elem *find_children_list(tid_t child_tid);
-#endif

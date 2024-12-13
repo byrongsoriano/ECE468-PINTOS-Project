@@ -24,6 +24,9 @@ static int64_t ticks;
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
 
+/* Threads waiting in timer_sleep(). */
+static struct list wait_list;
+
 static intr_handler_func timer_interrupt;
 static bool too_many_loops(unsigned loops);
 static void busy_wait(int64_t loops);
@@ -36,6 +39,8 @@ void timer_init(void)
 {
   pit_configure_channel(0, 2, TIMER_FREQ);
   intr_register_ext(0x20, timer_interrupt, "8254 Timer");
+
+  list_init(&wait_list);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -82,26 +87,36 @@ timer_elapsed(int64_t then)
   return timer_ticks() - then;
 }
 
+/* Compares two threads based on their wake-up times. */
+static bool
+compare_threads_by_wakeup_time(const struct list_elem *a_,
+                               const struct list_elem *b_,
+                               void *aux UNUSED)
+{
+  const struct thread *a = list_entry(a_, struct thread, timer_elem);
+  const struct thread *b = list_entry(b_, struct thread, timer_elem);
+
+  return a->wakeup_time < b->wakeup_time;
+}
+
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
 void timer_sleep(int64_t ticks)
 {
-  int64_t start = timer_ticks();
+  struct thread *t = thread_current();
 
+  /* Schedule our wake-up time. */
+  t->wakeup_time = timer_ticks() + ticks;
+
+  /* Atomically insert the current thread into the wait list. */
   ASSERT(intr_get_level() == INTR_ON);
+  intr_disable();
+  list_insert_ordered(&wait_list, &t->timer_elem,
+                      compare_threads_by_wakeup_time, NULL);
+  intr_enable();
 
-  /* ++ Use block to handle sleep */
-  if (ticks > 0)
-  {
-    enum intr_level old_intr_level = intr_disable();
-    struct thread *t = thread_current();
-    t->blocked_ticks = ticks;
-    thread_block();
-    intr_set_level(old_intr_level);
-  }
-  /* -- Old Implemtations  */
-  // while (timer_elapsed (start) < ticks)
-  //   thread_yield ();
+  /* Wait. */
+  sema_down(&t->timer_sema);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -173,17 +188,15 @@ timer_interrupt(struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick();
-  /* ++ Check block status for each thread */
-  thread_foreach(thread_check_blocked, NULL);
 
-  /* ++1.3 mlfqs*/
-  if (thread_mlfqs)
+  while (!list_empty(&wait_list))
   {
-    thread_mlfqs_increase_recent_cpu_by_one();
-    if (ticks % TIMER_FREQ == 0)
-      thread_mlfqs_update_load_avg_and_recent_cpu();
-    else if (ticks % 4 == 0)
-      thread_mlfqs_update_priority(thread_current());
+    struct thread *t = list_entry(list_front(&wait_list),
+                                  struct thread, timer_elem);
+    if (ticks < t->wakeup_time)
+      break;
+    sema_up(&t->timer_sema);
+    list_pop_front(&wait_list);
   }
 }
 
