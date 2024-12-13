@@ -1,5 +1,6 @@
 #include "filesys/file.h"
 #include <debug.h>
+#include <stdio.h>
 #include "filesys/inode.h"
 #include "threads/malloc.h"
 
@@ -165,4 +166,10 @@ file_tell (struct file *file)
 {
   ASSERT (file != NULL);
   return file->pos;
+}
+
+bool compareFiles(struct file *f1, struct file *f2){
+  //printf("inode of f1 is %x\n", f1->inode);
+  //printf("inode of f2 is %x\n", f2->inode);
+  return f1->inode == f2->inode;
 }

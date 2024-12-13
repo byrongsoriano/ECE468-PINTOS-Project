@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include "devices/speaker.h"
 #include "threads/io.h"
 #include "threads/interrupt.h"
 #include "threads/vaddr.h"
@@ -80,12 +79,6 @@ vga_putc (int c)
       cx = ROUND_UP (cx + 1, 8);
       if (cx >= COL_CNT)
         newline ();
-      break;
-
-    case '\a':
-      intr_set_level (old_level);
-      speaker_beep ();
-      intr_disable ();
       break;
       
     default:

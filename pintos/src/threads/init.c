@@ -1,20 +1,18 @@
 #include "threads/init.h"
 #include <console.h>
 #include <debug.h>
-#include <inttypes.h>
 #include <limits.h>
 #include <random.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "devices/kbd.h"
 #include "devices/input.h"
 #include "devices/serial.h"
-#include "devices/shutdown.h"
 #include "devices/timer.h"
 #include "devices/vga.h"
-#include "devices/rtc.h"
 #include "threads/interrupt.h"
 #include "threads/io.h"
 #include "threads/loader.h"
@@ -22,6 +20,9 @@
 #include "threads/palloc.h"
 #include "threads/pte.h"
 #include "threads/thread.h"
+#ifdef VM
+#include "vm/swap.h"
+#endif
 #ifdef USERPROG
 #include "userprog/process.h"
 #include "userprog/exception.h"
@@ -32,32 +33,26 @@
 #include "tests/threads/tests.h"
 #endif
 #ifdef FILESYS
-#include "devices/block.h"
-#include "devices/ide.h"
+#include "devices/disk.h"
 #include "filesys/filesys.h"
 #include "filesys/fsutil.h"
 #endif
 
+/* Amount of physical memory, in 4 kB pages. */
+size_t ram_pages;
+
 /* Page directory with kernel mappings only. */
-uint32_t *init_page_dir;
+uint32_t *base_page_dir;
 
 #ifdef FILESYS
 /* -f: Format the file system? */
 static bool format_filesys;
-
-/* -filesys, -scratch, -swap: Names of block devices to use,
-   overriding the defaults. */
-static const char *filesys_bdev_name;
-static const char *scratch_bdev_name;
-#ifdef VM
-static const char *swap_bdev_name;
 #endif
-#endif /* FILESYS */
 
-/* -ul: Maximum number of pages to put into palloc's user pool. */
-static size_t user_page_limit = SIZE_MAX;
+/* -q: Power off after kernel tasks complete? */
+bool power_off_when_done;
 
-static void bss_init (void);
+static void ram_init (void);
 static void paging_init (void);
 
 static char **read_command_line (void);
@@ -65,10 +60,8 @@ static char **parse_options (char **argv);
 static void run_actions (char **argv);
 static void usage (void);
 
-#ifdef FILESYS
-static void locate_block_devices (void);
-static void locate_block_device (enum block_type, const char *name);
-#endif
+static void print_stats (void);
+
 
 int main (void) NO_RETURN;
 
@@ -77,9 +70,9 @@ int
 main (void)
 {
   char **argv;
-
-  /* Clear BSS. */  
-  bss_init ();
+  
+  /* Clear BSS and get machine's RAM size. */  
+  ram_init ();
 
   /* Break command line into arguments and parse options. */
   argv = read_command_line ();
@@ -91,11 +84,10 @@ main (void)
   console_init ();  
 
   /* Greet user. */
-  printf ("Pintos booting with %'"PRIu32" kB RAM...\n",
-          init_ram_pages * PGSIZE / 1024);
+  printf ("Pintos booting with %'zu kB RAM...\n", ram_pages * PGSIZE / 1024);
 
   /* Initialize memory system. */
-  palloc_init (user_page_limit);
+  palloc_init ();
   malloc_init ();
   paging_init ();
 
@@ -122,38 +114,51 @@ main (void)
 
 #ifdef FILESYS
   /* Initialize file system. */
-  ide_init ();
-  locate_block_devices ();
+  disk_init ();
   filesys_init (format_filesys);
 #endif
 
+#ifdef VM
+  swap_init();
+#endif
+  
   printf ("Boot complete.\n");
   
   /* Run actions specified on kernel command line. */
   run_actions (argv);
 
   /* Finish up. */
-  shutdown ();
+  if (power_off_when_done)
+    power_off ();
   thread_exit ();
 }
 
-/* Clear the "BSS", a segment that should be initialized to
-   zeros.  It isn't actually stored on disk or zeroed by the
-   kernel loader, so we have to zero it ourselves.
-
-   The start and end of the BSS segment is recorded by the
-   linker as _start_bss and _end_bss.  See kernel.lds. */
+/* Clear BSS and obtain RAM size from loader. */
 static void
-bss_init (void) 
+ram_init (void) 
 {
+  /* The "BSS" is a segment that should be initialized to zeros.
+     It isn't actually stored on disk or zeroed by the kernel
+     loader, so we have to zero it ourselves.
+
+     The start and end of the BSS segment is recorded by the
+     linker as _start_bss and _end_bss.  See kernel.lds. */
   extern char _start_bss, _end_bss;
   memset (&_start_bss, 0, &_end_bss - &_start_bss);
+
+  /* Get RAM size from loader.  See loader.S. */
+  ram_pages = *(uint32_t *) ptov (LOADER_RAM_PGS);
 }
 
 /* Populates the base page directory and page table with the
    kernel virtual mapping, and then sets up the CPU to use the
-   new page directory.  Points init_page_dir to the page
-   directory it creates. */
+   new page directory.  Points base_page_dir to the page
+   directory it creates.
+
+   At the time this function is called, the active page table
+   (set up by loader.S) only maps the first 4 MB of RAM, so we
+   should not try to use extravagant amounts of memory.
+   Fortunately, there is no need to do so. */
 static void
 paging_init (void)
 {
@@ -161,9 +166,9 @@ paging_init (void)
   size_t page;
   extern char _start, _end_kernel_text;
 
-  pd = init_page_dir = palloc_get_page (PAL_ASSERT | PAL_ZERO);
+  pd = base_page_dir = palloc_get_page (PAL_ASSERT | PAL_ZERO);
   pt = NULL;
-  for (page = 0; page < init_ram_pages; page++)
+  for (page = 0; page < ram_pages; page++) 
     {
       uintptr_t paddr = page * PGSIZE;
       char *vaddr = ptov (paddr);
@@ -185,7 +190,7 @@ paging_init (void)
      new page tables immediately.  See [IA32-v2a] "MOV--Move
      to/from Control Registers" and [IA32-v3a] 3.7.5 "Base Address
      of the Page Directory". */
-  asm volatile ("movl %0, %%cr3" : : "r" (vtop (init_page_dir)));
+  asm volatile ("movl %0, %%cr3" : : "r" (vtop (base_page_dir)));
 }
 
 /* Breaks the kernel command line into words and returns them as
@@ -237,20 +242,10 @@ parse_options (char **argv)
       if (!strcmp (name, "-h"))
         usage ();
       else if (!strcmp (name, "-q"))
-        shutdown_configure (SHUTDOWN_POWER_OFF);
-      else if (!strcmp (name, "-r"))
-        shutdown_configure (SHUTDOWN_REBOOT);
+        power_off_when_done = true;
 #ifdef FILESYS
       else if (!strcmp (name, "-f"))
         format_filesys = true;
-      else if (!strcmp (name, "-filesys"))
-        filesys_bdev_name = value;
-      else if (!strcmp (name, "-scratch"))
-        scratch_bdev_name = value;
-#ifdef VM
-      else if (!strcmp (name, "-swap"))
-        swap_bdev_name = value;
-#endif
 #endif
       else if (!strcmp (name, "-rs"))
         random_init (atoi (value));
@@ -263,16 +258,6 @@ parse_options (char **argv)
       else
         PANIC ("unknown option `%s' (use -h for help)", name);
     }
-
-  /* Initialize the random number generator based on the system
-     time.  This has no effect if an "-rs" option was specified.
-
-     When running under Bochs, this is not enough by itself to
-     get a good seed value, because the pintos script sets the
-     initial time to a predictable value, not to the local time,
-     for reproducibility.  To fix this, give the "-r" option to
-     the pintos script to request real-time execution. */
-  random_init (rtc_get_time ());
   
   return argv;
 }
@@ -313,8 +298,8 @@ run_actions (char **argv)
       {"ls", 1, fsutil_ls},
       {"cat", 2, fsutil_cat},
       {"rm", 2, fsutil_rm},
-      {"extract", 1, fsutil_extract},
-      {"append", 2, fsutil_append},
+      {"put", 2, fsutil_put},
+      {"get", 2, fsutil_get},
 #endif
       {NULL, 0, NULL},
     };
@@ -362,68 +347,59 @@ usage (void)
           "  cat FILE           Print FILE to the console.\n"
           "  rm FILE            Delete FILE.\n"
           "Use these actions indirectly via `pintos' -g and -p options:\n"
-          "  extract            Untar from scratch device into file system.\n"
-          "  append FILE        Append FILE to tar file on scratch device.\n"
+          "  put FILE           Put FILE into file system from scratch disk.\n"
+          "  get FILE           Get FILE from file system into scratch disk.\n"
 #endif
           "\nOptions:\n"
           "  -h                 Print this help message and power off.\n"
           "  -q                 Power off VM after actions or on panic.\n"
-          "  -r                 Reboot after actions.\n"
-#ifdef FILESYS
-          "  -f                 Format file system device during startup.\n"
-          "  -filesys=BDEV      Use BDEV for file system instead of default.\n"
-          "  -scratch=BDEV      Use BDEV for scratch instead of default.\n"
-#ifdef VM
-          "  -swap=BDEV         Use BDEV for swap instead of default.\n"
-#endif
-#endif
+          "  -f                 Format file system disk during startup.\n"
           "  -rs=SEED           Set random number seed to SEED.\n"
           "  -mlfqs             Use multi-level feedback queue scheduler.\n"
 #ifdef USERPROG
           "  -ul=COUNT          Limit user memory to COUNT pages.\n"
 #endif
           );
-  shutdown_power_off ();
+  power_off ();
 }
+
+
+/* Powers down the machine we're running on,
+   as long as we're running on Bochs or QEMU. */
+void
+power_off (void) 
+{
+  const char s[] = "Shutdown";
+  const char *p;
 
 #ifdef FILESYS
-/* Figure out what block devices to cast in the various Pintos roles. */
-static void
-locate_block_devices (void)
-{
-  locate_block_device (BLOCK_FILESYS, filesys_bdev_name);
-  locate_block_device (BLOCK_SCRATCH, scratch_bdev_name);
-#ifdef VM
-  locate_block_device (BLOCK_SWAP, swap_bdev_name);
+  filesys_done ();
 #endif
+
+  print_stats ();
+
+  printf ("Powering off...\n");
+  serial_flush ();
+
+  for (p = s; *p != '\0'; p++)
+    outb (0x8900, *p);
+  asm volatile ("cli; hlt" : : : "memory");
+  printf ("still running...\n");
+  for (;;);
 }
 
-/* Figures out what block device to use for the given ROLE: the
-   block device with the given NAME, if NAME is non-null,
-   otherwise the first block device in probe order of type
-   ROLE. */
+/* Print statistics about Pintos execution. */
 static void
-locate_block_device (enum block_type role, const char *name)
+print_stats (void) 
 {
-  struct block *block = NULL;
-
-  if (name != NULL)
-    {
-      block = block_get_by_name (name);
-      if (block == NULL)
-        PANIC ("No such block device \"%s\"", name);
-    }
-  else
-    {
-      for (block = block_first (); block != NULL; block = block_next (block))
-        if (block_type (block) == role)
-          break;
-    }
-
-  if (block != NULL)
-    {
-      printf ("%s: using %s\n", block_type_name (role), block_name (block));
-      block_set_role (role, block);
-    }
-}
+  timer_print_stats ();
+  thread_print_stats ();
+#ifdef FILESYS
+  disk_print_stats ();
 #endif
+  console_print_stats ();
+  kbd_print_stats ();
+#ifdef USERPROG
+  exception_print_stats ();
+#endif
+}

@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "threads/init.h"
 #include "threads/loader.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
@@ -34,20 +35,26 @@ struct pool
   };
 
 /* Two pools: one for kernel data, one for user pages. */
-static struct pool kernel_pool, user_pool;
+struct pool kernel_pool, user_pool;
+
+/* Maximum number of pages to put in user pool. */
+size_t user_page_limit = SIZE_MAX;
 
 static void init_pool (struct pool *, void *base, size_t page_cnt,
                        const char *name);
 static bool page_from_pool (const struct pool *, void *page);
 
-/* Initializes the page allocator.  At most USER_PAGE_LIMIT
-   pages are put into the user pool. */
+/* Initializes the page allocator. */
 void
-palloc_init (size_t user_page_limit)
+palloc_init (void) 
 {
-  /* Free memory starts at 1 MB and runs to the end of RAM. */
-  uint8_t *free_start = ptov (1024 * 1024);
-  uint8_t *free_end = ptov (init_ram_pages * PGSIZE);
+  /* End of the kernel as recorded by the linker.
+     See kernel.lds.S. */
+  extern char _end;
+
+  /* Free memory. */
+  uint8_t *free_start = pg_round_up (&_end);
+  uint8_t *free_end = ptov (ram_pages * PGSIZE);
   size_t free_pages = (free_end - free_start) / PGSIZE;
   size_t user_pages = free_pages / 2;
   size_t kernel_pages;

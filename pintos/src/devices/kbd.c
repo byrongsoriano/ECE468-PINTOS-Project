@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <string.h>
 #include "devices/input.h"
-#include "devices/shutdown.h"
 #include "threads/interrupt.h"
 #include "threads/io.h"
 
@@ -54,7 +53,7 @@ struct keymap
    that we handle elsewhere.  */
 static const struct keymap invariant_keymap[] = 
   {
-    {0x01, "\033"},             /* Escape. */
+    {0x01, "\033"},
     {0x0e, "\b"},
     {0x0f, "\tQWERTYUIOP"},
     {0x1c, "\r"},
@@ -62,7 +61,6 @@ static const struct keymap invariant_keymap[] =
     {0x2c, "ZXCVBNM"},
     {0x37, "*"},
     {0x39, " "},
-    {0x53, "\177"},             /* Delete. */
     {0, NULL},
   };
 
@@ -133,10 +131,6 @@ keyboard_interrupt (struct intr_frame *args UNUSED)
       /* Ordinary character. */
       if (!release) 
         {
-          /* Reboot if Ctrl+Alt+Del pressed. */
-          if (c == 0177 && ctrl && alt)
-            shutdown_reboot ();
-
           /* Handle Ctrl, Shift.
              Note that Ctrl overrides Shift. */
           if (ctrl && c >= 0x40 && c < 0x60) 

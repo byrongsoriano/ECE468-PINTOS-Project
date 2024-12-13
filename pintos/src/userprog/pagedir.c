@@ -18,9 +18,11 @@ pagedir_create (void)
 {
   uint32_t *pd = palloc_get_page (0);
   if (pd != NULL)
-    memcpy (pd, init_page_dir, PGSIZE);
+    memcpy (pd, base_page_dir, PGSIZE);
   return pd;
 }
+
+/* This is 2016 spring cs330 skeleton code */
 
 /* Destroys page directory PD, freeing all the pages it
    references. */
@@ -32,7 +34,7 @@ pagedir_destroy (uint32_t *pd)
   if (pd == NULL)
     return;
 
-  ASSERT (pd != init_page_dir);
+  ASSERT (pd != base_page_dir);
   for (pde = pd; pde < pd + pd_no (PHYS_BASE); pde++)
     if (*pde & PTE_P) 
       {
@@ -57,7 +59,7 @@ static uint32_t *
 lookup_page (uint32_t *pd, const void *vaddr, bool create)
 {
   uint32_t *pt, *pde;
-
+  //printf("In lookup_page\n");
   ASSERT (pd != NULL);
 
   /* Shouldn't create new kernel virtual mappings. */
@@ -103,8 +105,8 @@ pagedir_set_page (uint32_t *pd, void *upage, void *kpage, bool writable)
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (pg_ofs (kpage) == 0);
   ASSERT (is_user_vaddr (upage));
-  ASSERT (vtop (kpage) >> PTSHIFT < init_ram_pages);
-  ASSERT (pd != init_page_dir);
+  ASSERT (vtop (kpage) >> PTSHIFT < ram_pages);
+  ASSERT (pd != base_page_dir);
 
   pte = lookup_page (pd, upage, true);
 
@@ -220,7 +222,7 @@ void
 pagedir_activate (uint32_t *pd) 
 {
   if (pd == NULL)
-    pd = init_page_dir;
+    pd = base_page_dir;
 
   /* Store the physical address of the page directory into CR3
      aka PDBR (page directory base register).  This activates our

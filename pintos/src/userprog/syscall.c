@@ -2,497 +2,395 @@
 #include <stdio.h>
 #include <string.h>
 #include <syscall-nr.h>
-#include "devices/input.h"
-#include "devices/shutdown.h"
-#include "threads/interrupt.h"
-#include "threads/thread.h"
-#include "threads/init.h"
-#include "threads/vaddr.h"
-#include "userprog/pagedir.h"
-#include "userprog/process.h"
+#include "filesys/directory.h"
 #include "filesys/file.h"
 #include "filesys/filesys.h"
+#include "threads/interrupt.h"
+#include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "threads/init.h"
 #include "threads/malloc.h"
+#include "lib/kernel/list.h"
+#include "process.h"
+#include "vm/page.h"
 
-static void syscall_handler(struct intr_frame *);
-void get_args_from_stack(const void *esp, char *argv, int count);
-bool verify_ptr(const void *vaddr);
 
-void syscall_init(void)
+static void syscall_handler (struct intr_frame *);
+static int get_free_fd(struct thread *curr);
+static int validate_addr(const void *addr, void *esp, bool to_grow);
+static int validate_string(char *str, void *esp);
+static int validate_buffer(char *buffer, int size, void *esp, bool writable);
+void exit_process(int status);
+
+void
+syscall_init (void) 
 {
-  // Initialize file lock
-  lock_init(&filesys_lock);
-  intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall");
+  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
 
-static void syscall_handler(struct intr_frame *f)
+static void
+syscall_handler (struct intr_frame *f UNUSED) 
 {
-  // Get stack pointer
-  int *esp = f->esp;
-
-  // Verify stack pointer
-  if(!verify_ptr((const void*)(esp))) {
-    // printf("STACK PTR ERROR\n");
-    syscall_exit(-1);
-    return;
-  }
-
-  switch (*(int *)esp)
-  {
-  case SYS_HALT:
-    syscall_halt();
-    break;
+  int *sys_stack = f->esp;
+  validate_addr((void *) sys_stack, f->esp, false);
+  int sys_call = sys_stack[0];
+  struct file *fp;
+  switch(sys_call){
+    case SYS_HALT:
+      power_off();
+      break;
+    
     case SYS_EXIT:
-      if(!verify_ptr((const void*)(esp + 1))) {
-        syscall_exit(-1);
-        break;
-      }
-      syscall_exit((int)*(esp+1));
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      //printf("exit syscall\n");
+      exit_process(sys_stack[1]);
       break;
+
     case SYS_EXEC:
-      // validate cmd line arguments
-      if(!verify_ptr((void*)(esp + 1)) || !verify_ptr((void*)(*(esp + 1))))
-        syscall_exit(-1);
-      // put result from syscall_exec into return register
-      f->eax = syscall_exec((const char*)*(esp+1));
+      validate_addr((void *) (sys_stack + 1), f->esp, false);
+      validate_string((char *) sys_stack[1], f->esp);
+      f->eax = process_execute((char *) sys_stack[1]);
       break;
+
     case SYS_WAIT:
-        if (!verify_ptr((const void *)(esp + 1))) {
-            syscall_exit(-1);
-        }
-        f->eax = syscall_wait((pid_t)*(esp + 1));
-        break;
-      case SYS_CREATE:
-          // validate cmd line arguments
-          if (!verify_ptr((void *)(esp + 5)) || !verify_ptr((void *)(*(esp + 4))))
-              syscall_exit(-1);
-          // put result from syscall_create into return register
-          f->eax = syscall_create((const char *)*(esp + 4), (unsigned)*(esp + 5));
-          break;
-      case SYS_REMOVE:
-          if (!verify_ptr((void *)(esp + 1)) || !verify_ptr((void *)(*(esp + 1))))
-              syscall_exit(-1);
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      f->eax = process_wait(sys_stack[1]);
+      break;
 
-          f->eax = syscall_remove((const char *)*(esp + 1));
-          break;
+    case SYS_CREATE:
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      validate_addr((uint8_t *) (sys_stack+2), f->esp, false);
+      validate_string((char *) sys_stack[1], f->esp);
+      acquire_filesys();
+      f->eax = filesys_create((char *) sys_stack[1], sys_stack[2]);
+      release_filesys();
+      break;
+
+    case SYS_REMOVE:
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      validate_string((char *) sys_stack[1], f->esp);
+      acquire_filesys();
+      f->eax = filesys_remove((char *) sys_stack[1]);
+      release_filesys();
+      break;
+
     case SYS_OPEN:
-      if(!verify_ptr((const void*)(esp + 1)) || !verify_ptr((const void*)*(esp + 1))) {
-        syscall_exit(-1);
-        break;
-      }
-      f->eax = (uint32_t) syscall_open((char *)*(esp + 1));
-      break;
-    case SYS_FILESIZE:
-      if(!verify_ptr((const void*)(esp + 1))) {
-        syscall_exit(-1);
-        break;
-      }
-      f->eax = syscall_filesize((int)*(esp+1));
-      break;
-    case SYS_SEEK:
-        if(!verify_ptr((const void*)(esp+4)) || !verify_ptr((const void*)(esp+5))){
-            syscall_exit(-1);
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      validate_string((char *) sys_stack[1], f->esp);
+
+      acquire_filesys();
+      fp = filesys_open((char *) sys_stack[1]);
+      release_filesys();
+      if (fp == NULL)
+        f->eax = -1;
+      else{
+        int free = get_free_fd(thread_current());
+        if (free != -1){
+          thread_current()->open_files[free] = fp;
+          f->eax = free;
         }
-        syscall_seek((int)(*(esp+4)), (unsigned) (*(esp+5)));
-    break;
-  case SYS_READ:
-    if (verify_ptr((const void *)(esp + 5)) && verify_ptr((const void *)(esp + 6)) && verify_ptr((const void *)(esp + 7)) && verify_ptr((const void*)*(esp + 6)))
-    {
-      f->eax = (uint32_t)syscall_read((int)*(esp + 5), (void *)*(esp + 6), (unsigned int)*(esp + 7));
-    }
-    else
-    {
-      syscall_exit(-1);
-    }
-    break;
-  case SYS_WRITE:
-    if (verify_ptr((const void *)(esp + 5)) && verify_ptr((const void *)(esp + 6)) && verify_ptr((const void *)(esp + 7)) && verify_ptr((const void*)*(esp + 6)))
-    {
-      // printf("fd: %d  buf: %d,  size: %d\n", *(esp+5), *(esp+6), *(esp+7));
-      f->eax = (uint32_t)syscall_write((int)*(esp + 5), (const void *)*(esp + 6), (unsigned)*(esp + 7));
-      // printf("bytes written: %d\n", f->eax);
-    }
-    else
-    {
-      syscall_exit(-1);
-    }
-    break;
-  case SYS_TELL:
-    if (!verify_ptr((const void *)(esp + 1)))
-    {
-      syscall_exit(-1);
+        else
+          f->eax = -1;
+      }
       break;
-    }
-    f->eax = syscall_tell((int)*(esp + 1));
-    break;
-  case SYS_CLOSE:
-    if (!verify_ptr((const void *)(esp + 1))) {
-      syscall_exit(-1);
+
+    case SYS_FILESIZE:
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      fp = thread_current()->open_files[sys_stack[1]];
+      if (fp == NULL)
+        f->eax = 0;
+      else{
+        acquire_filesys();
+        f->eax = file_length(fp);
+        release_filesys();
+      }
       break;
-    }
 
-    syscall_close((int)*(esp + 1));
-    break;
-  }
-}
-/* Terminates Pintos by calling shutdown_power_off() (declared in threads/init.h).
- * This should be seldom used, because you lose some information about possible deadlock situations, etc.
- */
-void syscall_halt(void)
-{
-  shutdown_power_off();
-}
+    case SYS_READ:
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      validate_addr((void *) (sys_stack+2), f->esp, false);
+      validate_addr((void *) (sys_stack+3), f->esp, false);
+      validate_buffer((char *) sys_stack[2], sys_stack[3], f->esp, true);
 
-/* Terminates the current user program, returning status to the kernel.
- * If the process's parent waits for it (see below), this is the status that will be returned.
- * Conventionally, a status of 0 indicates success and nonzero values indicate errors.
- */
-void syscall_exit(int status)
-{
-  struct list_elem *e;
+      if (sys_stack[1] == 0){
+        // Reading from STDIN
+        uint8_t *buf = (uint8_t *) sys_stack[2];
+        int i;
+        for (i = 0; i < sys_stack[3]; i++)
+          buf[i] = input_getc();
+        f->eax = sys_stack[3];
+      }
+      else if (2 <= sys_stack[1] && sys_stack[1] < 128){
+        fp = thread_current()->open_files[sys_stack[1]];
+        if (fp == NULL)
+          f->eax = 0;
+        else{
+          acquire_filesys();
+          f->eax = file_read(fp, sys_stack[2], sys_stack[3]);
+          release_filesys();
+        }
+      }
+      else
+        f->eax = 0;
+      break;
+    
+    case SYS_WRITE:
+      //printf("WRITE SYSCALL!\n");
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      validate_addr((void *) (sys_stack+2), f->esp, false);
+      validate_addr((void *) (sys_stack+3), f->esp, false);
+      validate_buffer((char *) sys_stack[2], sys_stack[3], f->esp, false);
+      int fd = sys_stack[1];
+      char *buf = (char *) sys_stack[2];
+      int size = sys_stack[3];
+      if (fd == 1){
+        putbuf(buf, size);
+        f->eax = size;
+      }
+      else if (2 <= fd && fd < 128){
+        fp = thread_current()->open_files[fd];
+        if (fp == NULL)
+          f->eax = 0;
+        else{
+          // TODO: implement write until size permits using tell and file size
+          acquire_filesys();
+          f->eax = file_write(fp, buf, size);
+          release_filesys();
+        }
+      }
+      else
+        f->eax = 0;
+      break;
 
-  // Loop through children thread of parent thread
-  for (e = list_begin(&thread_current()->parent->children); e != list_end(&thread_current()->parent->children); e = list_next(e))
-  {
-    struct child *f = list_entry(e, struct child, elem);
-    // Check if the parent is waiting for this current thread
-    if (f->tid == thread_current()->tid)
-    {
-      sema_up(&thread_current()->parent->child_lock);
-      f->used = true;         // parent is currently using this thread
-      f->exit_error = status; // return the current status to the parent thread
-      sema_down(&thread_current()->parent->child_lock);
-    }
-  }
 
-  if(thread_current()->parent->waiting_td == thread_current()->tid) {
-    sema_up(&thread_current()->parent->child_lock);
-  }
+    case SYS_SEEK:
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      validate_addr((void *) (sys_stack+2), f->esp, false);
+      fp = thread_current()->open_files[sys_stack[1]];
+      if (fp != NULL){
+        acquire_filesys();
+        file_seek(fp, sys_stack[2]);
+        release_filesys();
+      }
+      break;
 
-  thread_current()->parent->finish = true;
-  thread_current()->exit_error = status;
-  // printf("%s: exit(%d)\n", thread_current()->name, status); // Needed this for the perl .ck files
-  thread_exit();
-}
+    case SYS_TELL:
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      fp = thread_current()->open_files[sys_stack[1]];
+      if (fp == NULL)
+        f->eax = -1;
+      else{
+        acquire_filesys();
+        f->eax = file_tell(fp);
+        release_filesys();
+      }
+      break;
 
-/* Runs the executable whose name is given in cmd_line, passing any given arguments,
- * and returns the new process's program id (pid). Must return pid -1, which otherwise
- * should not be a valid pid, if the program cannot load or run for any reason.
- * Thus, the parent process cannot return from the exec until it knows whether the child
- * process successfully loaded its executable. You must use appropriate synchronization to ensure this.
- */
-pid_t syscall_exec(const char *cmd_line) {
-  // use synchronization to check the child process
-  lock_acquire(&filesys_lock);
+    case SYS_MMAP:
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      validate_addr((void *) (sys_stack+2), f->esp, false);
+      //validate_addr((void *) sys_stack[2], f->esp, false);
+      f->eax = mmap(sys_stack[1], (void *) sys_stack[2]);
+      break;
 
-  // Get file name from cmd line
-  char *cmdline_ptr;
-  char *file_name;
-  file_name = (char *) malloc(strlen(cmd_line) + 1);
-  strlcpy(file_name, cmd_line, strlen(cmd_line) + 1);
-  file_name = strtok_r(file_name, " ", &cmdline_ptr);
+    case SYS_MUNMAP:
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      munmap(sys_stack[1]);
+      break;
 
-  // check to see if the file exists
-  struct file* f = filesys_open(file_name);
-
-  // if file does not exist, return -1
-  if(f==NULL){
-    lock_release(&filesys_lock);
-    return -1;
-  }else{
-    file_close(f);
-    // call process_execute in process.c to start a new thread, and return program id
-    lock_release(&filesys_lock);
-    return process_execute(cmd_line);
-  }
-}
-
-/* Waits for a child process pid and retrieves the child's exit status. */
-int syscall_wait(pid_t pid)
-{
-  return process_wait(pid);
-}
-
-/* Creates a new file called file initially initial_size bytes in size.
- * Returns true if successful, false otherwise. Creating a new file does not open it:
- * opening the new file is a separate operation which would require a open system call.
- */
-bool syscall_create(const char *file, unsigned initial_size)
-{
-  lock_acquire(&filesys_lock);
-  // call filesys_create from filesys.h
-  bool result = filesys_create(file, initial_size);
-  lock_release(&filesys_lock);
-  return result;
-}
-
-/* Deletes the file called file. Returns true if successful, false otherwise.
- * A file may be removed regardless of whether it is open or closed, and removing
- * an open file does not close it.
- */
-bool syscall_remove(const char *file)
-{
-  lock_acquire(&filesys_lock);
-  bool ret = filesys_remove(file);
-  lock_release(&filesys_lock);
-  return ret;
-}
-
-/* Opens the file called file. Returns a nonnegative integer handle called a
- * "file descriptor" (fd), or -1 if the file could not be opened.
- */
-int syscall_open(const char *file)
-{
-  lock_acquire(&filesys_lock);
-  struct file *fd_struct = filesys_open(file); // open file
-
-  // if file doesn't exist, exit
-  if (fd_struct == NULL)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
-
-  // Add the file to the list of opened files of the current thread
-  struct file_descriptor *new_fd = malloc(sizeof(struct file_descriptor));
-  new_fd->file = fd_struct;
-  new_fd->fd = thread_current()->fd;
-  thread_current()->fd++;
-  list_push_back(&thread_current()->file_list, &new_fd->elem);
-  lock_release(&filesys_lock);
-  return new_fd->fd;
-}
-
-/* Returns the size, in bytes, of the file open as fd. */
-int syscall_filesize(int fd)
-{
-  lock_acquire(&filesys_lock);
-  struct file *fd_struct = getFile(fd); // get the file within the file list
-
-  // If file doesn't exist in the list, exit
-  if (fd_struct == NULL)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
-
-  // Get the file length
-  int filesize = file_length(fd_struct);
-  lock_release(&filesys_lock);
-
-  return filesize;
-}
-
-/* Reads size bytes from the file open as fd into buffer. Returns the number
- * of bytes actually read (0 at end of file), or -1 if the file could not be read
- * (due to a condition other than end of file). Fd 0 reads from the keyboard using input_getc().
- */
-int syscall_read(int fd, void *buffer, unsigned size)
-{
-
-  if (size < 0)
-  {
-    return -1;
-  }
-  if (fd == STDIN_FILENO)
-  {
-    uint8_t *buf = buffer;
-    for (size_t i = 0; i < size; i++)
-    {
-      buf[i] = input_getc(); // get input character from input buffer (key press)
-    }
-    return size;
-  }
-  if (fd == STDOUT_FILENO)
-  {
-    return -1;
-  }
-
-  // Read file
-  lock_acquire(&filesys_lock);
-  struct file *fd_struct = getFile(fd);
-
-  if (fd_struct == NULL)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
-
-  int bytes_read = file_read(fd_struct, buffer, size);
-  lock_release(&filesys_lock);
-  return bytes_read;
-}
-
-/* Writes size bytes from buffer to the open file fd. Returns the number of bytes
- * actually written, which may be less than size if some bytes could not be written.
- */
-int syscall_write(int fd, const void *buffer, unsigned size)
-{
-
-  if (size < 0)
-  {
-    return -1;
-  }
-
-  if (fd == STDIN_FILENO)
-  {
-    return -1;
-  }
-  if (fd == STDOUT_FILENO)
-  {
-    putbuf(buffer, size);
-    return size;
-  }
-
-  // write to file
-  lock_acquire(&filesys_lock);
-  struct file *fd_struct = getFile(fd);
-
-  if (fd_struct == NULL)
-  {
-    lock_release(&filesys_lock);
-    return -1;
-  }
-
-  int bytes_written = file_write(fd_struct, buffer, size);
-  lock_release(&filesys_lock);
-  return bytes_written;
-}
-
-/* Changes the next byte to be read or written in open file fd to position,
- * expressed in bytes from the beginning of the file. (Thus, a position of 0 is the file's start.)
- */
-void syscall_seek(int fd, unsigned position) {
-    lock_acquire(&filesys_lock);
-    struct file *fd_struct = getFile(fd);
-
-    if (fd_struct == NULL) {
-        lock_release(&filesys_lock);
+    case SYS_CLOSE:
+      validate_addr((void *) (sys_stack+1), f->esp, false);
+      fp = thread_current()->open_files[sys_stack[1]];
+      if (fp == NULL){
         return;
-    }
-    file_seek(fd_struct, position);
-    lock_release(&filesys_lock);
-}
-/* Returns the position of the next byte to be read or written in open file fd,
- * expressed in bytes from the beginning of the file.
- */
-unsigned syscall_tell(int fd)
-{
-  lock_acquire(&filesys_lock);
-  struct file *fd_struct = getFile(fd); // get file in file list
+      }
+      else{
+        acquire_filesys();
+        file_close(fp);
+        thread_current()->open_files[sys_stack[1]] = NULL;
+        release_filesys();
+      }
+      break;
 
-  // If file doesn't exist, exit
-  if (fd_struct == NULL)
-  {
-    lock_release(&filesys_lock);
+    default:
+      return;
+  }
+}
+
+static int get_free_fd(struct thread *curr){
+  int i;
+  for (i = 2; i < 128; i++){
+    if (curr->open_files[i] == NULL)
+      return i;
+  }
+  return -1;
+}
+
+int mmap(int fd, void* vaddr) {
+  //printf("MMAP call\n\n\n");
+  struct thread *curr = thread_current();
+  struct file *oldf = curr->open_files[fd];
+  if (oldf == NULL)
+    return -1;
+  
+  if (!is_user_vaddr(vaddr) || pg_ofs(vaddr) != 0 || vaddr == NULL)
+    return -1;
+
+  struct file *f = file_reopen(oldf);
+  if (f == NULL || file_length(f) == 0)
+    return -1;
+  
+  curr->map_id++;
+  off_t ofs = 0;
+  size_t read_bytes = file_length(f);
+  //printf("mapping %d bytes\n", read_bytes);
+  while(read_bytes > 0){
+    size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+    size_t page_zero_bytes = PGSIZE - page_read_bytes;
+
+    //printf("allocating mmap page: vaddr %p, ofs %d\n");
+    struct sup_page_table_entry *spte = allocate_page_mmap(vaddr, f, 
+                      curr->map_id, ofs, page_read_bytes, page_zero_bytes);
+    if (spte == NULL){
+      munmap(curr->map_id);
+      //printf("MMAP: spte is NULL\n");
+      return -1;
+    }
+    if (hash_insert(&curr->spt, &spte->h_elem) != NULL){
+      munmap(curr->map_id);
+      //printf("MMAP: could not insert to hash\n");
+      return -1;
+    }
+    read_bytes -= page_read_bytes;
+    ofs += page_read_bytes;
+    vaddr += PGSIZE;
+  }
+  return curr->map_id;
+}
+
+void munmap(int map_id){
+  unmap(map_id);
+}
+
+static int validate_addr(const void *addr, void *esp, bool to_grow){
+  //printf("validate_addr: addr %p esp %p to_grow %d\n", addr, esp, to_grow);
+  if (!is_user_vaddr(addr)){
+    //printf("validate_addr: !is_user_vaddr\n");
+    exit_process(-1);
     return -1;
   }
-
-  // File tell
-  int byte_pos = file_tell(fd_struct);
-  lock_release(&filesys_lock);
-
-  return byte_pos;
+  
+  struct sup_page_table_entry *spte = get_page(addr);
+  if (spte != NULL){
+    //printf("validate_addr: got page\n");
+    if (load_page(spte))
+      return 0;
+    else{
+      exit_process(-1);
+      return -1;
+    }
+    //printf("validate_addr: couldn't load\n");
+  }
+	else if (to_grow && addr >= (char *) esp - 32){
+    //printf("validate_addr: trying to grow stack\n");
+		struct sup_page_table_entry *spte = allocate_page_stack(addr);
+    if (spte != NULL){
+      if (load_page(spte))
+        return 0;
+      else{
+        free(spte);
+        exit_process(-1);
+        return -1;
+      }
+      //printf("validate_addr: couldn't grow stack\n");
+    }
+    else{
+      exit_process(-1);
+      return -1;
+      //printf("validate_addr: couldn't allocate page for stack\n");
+    }
+	}
+  //printf("Reached here\n");
+  exit_process(-1);
+  //printf("validate_addr: reached here\n");
+  return -1;
 }
 
-/* Closes file descriptor fd. Exiting or terminating a process implicitly closes all its
- * open file descriptors, as if by calling this function for each one.
- */
-void syscall_close(int fd)
-{
-  // Lock file to prevent issues
-  lock_acquire(&filesys_lock);
+static int validate_string(char *str, void *esp){
+  //printf("validate_string\n");
+  if(validate_addr(str, esp, false) == -1){
+    exit_process(-1);
+    return -1;
+  }
+  int i = 0;
+  while(str[i] != '\0'){
+    if (validate_addr(str + i, esp, true) == -1){
+      //printf("validate_string: bad string\n");
+      exit_process(-1);
+      return -1;
+    }
+    i++;
+  }
+  return 0;
+}
 
-  struct thread *td = thread_current();
-  struct list_elem *list;
-  struct file_descriptor *f_descriptor;
-
-  // Traverse through list of files that are currently open
-  for (list = list_begin(&td->file_list); list != list_end(&td->file_list); list = list_next(list))
-  {
-    f_descriptor = list_entry(list, struct file_descriptor, elem);
-    // Find target file to close
-    if (fd == f_descriptor->fd)
-    {
-      // Close file
-      file_close(f_descriptor->file);
-
-      // Remove file from list
-      list_remove(list);
+static int validate_buffer(char *buffer, int size, void *esp, bool writable){
+  //printf("validate_buffer\n");
+  int i;
+  for (i = 0; i < size; i++){
+    if (validate_addr(buffer + i, esp, true) == -1){
+      //printf("validate_buffer: bad buffer address\n");
+      exit_process(-1);
+      return -1;
+    }
+    struct sup_page_table_entry *spte = get_page(buffer + i);
+    if (spte != NULL && writable){
+      if (spte->read_only){
+        //printf("validate_buffer: trying to write to read_only buffer\n");
+        exit_process(-1);
+        return -1;
+      }
     }
   }
-
-  // Deallocate memory reserved for f_descriptor
-  free(f_descriptor);
-
-  // Unlock once done closing file
-  lock_release(&filesys_lock);
+  return 0;
 }
 
-struct file *getFile(int fd)
-{
-  struct thread *td = thread_current();
-  struct list_elem *list;
-  struct file_descriptor *f_descriptor;
+void exit_process(int status)
+{ 
+  struct thread *curr = thread_current();
 
-  // Loop through file list of current thread
-  for (list = list_begin(&td->file_list); list != list_end(&td->file_list); list = list_next(list))
-  {
-    f_descriptor = list_entry(list, struct file_descriptor, elem);
-    if (fd == f_descriptor->fd)
+
+  // TODO: Below code should not commented actually. However, it fails multi-oom.
+  /*
+  while (!list_empty(&curr->child_processes)){
+    struct list_elem *e = list_pop_front(&curr->child_processes);
+    struct child *ch = list_entry(e, struct child, child_elem);
+    free(ch);
+  }
+  */
+
+  if (curr->parent){
+    curr->cp->exit_status = status;
+    if (curr->cp->waited_by_parent)
+      sema_up(&curr->cp->wait_lock);
+    /*
+    struct child *ch;
+    struct list_elem *e;
+    for (e = list_begin(&curr->parent->child_processes);
+          e != list_end(&curr->parent->child_processes);
+          e = list_next(e))
     {
-      return f_descriptor->file; // found file. return it
+      ch = list_entry(e, struct child, child_elem);
+      if(ch->tid == curr->tid){
+        ch->exit_status = status;
+        if (ch->waited_by_parent)
+          sema_up(&curr->parent->child_lock);
+        break;
+      }
     }
+    */
   }
-  return NULL;
-}
-
-bool verify_ptr(const void *vaddr)
-{
-  // Check to make sure address is not a null pointer
-  bool isNullAddr = vaddr == NULL;
-
-  // Check if address is pointer to kernel virtual address space
-  bool isKernelSpace = is_kernel_vaddr(vaddr);
-
-  if (isNullAddr)
-  {
-    // printf("INVALID POINTER: Null Pointer\n");
-    thread_current()->exit_error = -1;
-    return false;
-  }
-  else if (isKernelSpace)
-  {
-    // printf("INVALID POINTER: Pointer to kernel virtual address space\n");
-    thread_current()->exit_error = -1;
-    return false;
-  }
-  else
-  {
-    // Check if address is pointer to unmapped virtual memory
-    struct thread *td = thread_current();
-    bool isUaddrMapped = pagedir_get_page(td->pagedir, vaddr) != NULL; // pagedir_get_page returns NULL if UADDR is unmapped
-    if (!isUaddrMapped)
-    {
-      // printf("INVALID POINTER: Unmapped to virtual memory\n");
-      thread_current()->exit_error = -1;
-      return false;
-    }
-  }
-  return true;
-}
-
-void close_all_files(struct list *files)
-{
-  struct list_elem *list;
-  struct file_descriptor *f_descriptor;
-
-  // While the file list is not empty
-  while (!list_empty(files))
-  {
-    list = list_pop_front(files); // Pop it off the list
-    f_descriptor = list_entry(list, struct file_descriptor, elem);
-    file_close(f_descriptor->file); // Close the file that was popped off the list
-    free(f_descriptor);
-  }
+  
+  printf("%s: exit(%d)\n", curr->name, status);
+	thread_exit();
 }
