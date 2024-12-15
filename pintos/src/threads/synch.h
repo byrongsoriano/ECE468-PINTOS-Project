@@ -7,8 +7,8 @@
 /* A counting semaphore. */
 struct semaphore
 {
-  unsigned value;      /* Current value. */
-  struct list waiters; /* List of waiting threads. */
+	unsigned value; /* Current value. */
+	struct list waiters; /* List of waiting threads. */
 };
 
 void sema_init(struct semaphore *, unsigned value);
@@ -17,15 +17,23 @@ bool sema_try_down(struct semaphore *);
 void sema_up(struct semaphore *);
 void sema_self_test(void);
 
+/*******************************/
+bool lock_priority_less_helper(const struct list_elem *a,
+		const struct list_elem *b, void *aux);
+bool sema_priority_less_helper(const struct list_elem *a,
+		const struct list_elem *b, void *aux);
+/*******************************/
+
 /* Lock. */
 struct lock
 {
-  struct thread *holder;      /* Thread holding lock (for debugging). */
-  struct semaphore semaphore; /* Binary semaphore controlling access. */
+	struct thread *holder; /* Thread holding lock (for debugging). */
+	struct semaphore semaphore; /* Binary semaphore controlling access. */
 
-  /* ++1.2 Priority Donation*/
-  struct list_elem elem; /* List element for priority donation. */
-  int max_priority;      /* Max priority among the threads acquiring the lock. */
+	/***************************/
+	int priority;
+	struct list_elem lock_holder_elem;
+	/***************************/
 };
 
 void lock_init(struct lock *);
@@ -37,7 +45,7 @@ bool lock_held_by_current_thread(const struct lock *);
 /* Condition variable. */
 struct condition
 {
-  struct list waiters; /* List of waiting threads. */
+	struct list waiters; /* List of waiting threads. */
 };
 
 void cond_init(struct condition *);
@@ -47,12 +55,9 @@ void cond_broadcast(struct condition *, struct lock *);
 
 /* Optimization barrier.
 
-   The compiler will not reorder operations across an
-   optimization barrier.  See "Optimization Barriers" in the
-   reference guide for more information.*/
-#define barrier() asm volatile("" : : : "memory")
-
-/* ++1.2 */
-bool cond_sema_cmp_priority(const struct list_elem *, const struct list_elem *, void *);
+ The compiler will not reorder operations across an
+ optimization barrier.  See "Optimization Barriers" in the
+ reference guide for more information.*/
+#define barrier() asm volatile ("" : : : "memory")
 
 #endif /* threads/synch.h */
