@@ -224,7 +224,7 @@ intr_yield_on_return (void)
   ASSERT (intr_context ());
   yield_on_return = true;
 }
-
+
 /* 8259A Programmable Interrupt Controller. */
 
 /* Initializes the PICs.  Refer to [8259A] for details.
@@ -360,8 +360,6 @@ intr_handler (struct intr_frame *frame)
       in_external_intr = true;
       yield_on_return = false;
     }
-  else 
-    thread_current ()->user_esp = frame->esp;
 
   /* Invoke the interrupt's handler. */
   handler = intr_handlers[frame->vec_no];

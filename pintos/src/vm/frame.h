@@ -1,23 +1,15 @@
 #ifndef VM_FRAME_H
 #define VM_FRAME_H
 
-#include <stdbool.h>
-#include "threads/synch.h"
+#include "vm/struct.h"
+#include "threads/palloc.h"
 
-/* A physical frame. */
-struct frame 
-  {
-    struct lock lock;           /* Prevent simultaneous access. */
-    void *base;                 /* Kernel virtual base address. */
-    struct page *page;          /* Mapped process page, if any. */
-  };
+void VM_free_frame(void *address, uint32_t *pagedir);
 
-void frame_init (void);
+void *VM_get_frame(void *frame, uint32_t *pagedir, enum palloc_flags flags);
 
-struct frame *frame_alloc_and_lock (struct page *);
-void frame_lock (struct page *);
+struct frame_struct *address_to_frame(void *address);
 
-void frame_free (struct frame *);
-void frame_unlock (struct frame *);
-
-#endif /* vm/frame.h */
+void evict(void);
+bool eviction_clock(struct frame_struct *vf);
+#endif

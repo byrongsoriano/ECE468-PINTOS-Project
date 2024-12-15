@@ -1,318 +1,381 @@
-#include "vm/page.h"
-#include <stdio.h>
-#include <string.h>
-#include "vm/frame.h"
-#include "vm/swap.h"
-#include "filesys/file.h"
-#include "threads/malloc.h"
-#include "threads/thread.h"
-#include "userprog/pagedir.h"
-#include "threads/vaddr.h"
+#include "vm/struct.h"
 
-/* Maximum size of process stack, in bytes. */
-/* Right now it is 1 megabyte. */
-#define STACK_MAX (1024 * 1024)
-
-/* Destroys a page, which must be in the current process's
-   page table.  Used as a callback for hash_destroy(). */
-static void
-destroy_page (struct hash_elem *p_, void *aux UNUSED)
+// Initialise everything
+void VM_init(void)
 {
-  struct page *p = hash_entry (p_, struct page, hash_elem);
-  frame_lock (p);
-  if (p->frame)
-    frame_free (p->frame);
-  free (p);
+	int i;
+	for (i = 0; i < NO_OF_LOCKS; i++)
+	{
+		lock_init(&l[i]);
+	}
+	hash_init(&hash_frame, frame_hash, frame_less_helper, NULL);
+	hash_init(&hash_mmap, mmap_hash, mmap_less_helper, NULL);
+	list_init(&hash_frame_list);
+	swap_block = block_get_role(BLOCK_SWAP);
+	swap_size = block_size(swap_block);
+	swap_bitmap = bitmap_create(swap_size);
 }
 
-/* Destroys the current process's page table. */
-void
-page_exit (void)
+struct page_struct *VM_new_page(int type, void *virt_address, bool writable,
+		struct file *file, off_t ofs, size_t read_bytes, size_t zero_bytes,
+		off_t block_id)
 {
-  struct hash *h = thread_current ()->pages;
-  if (h != NULL)
-    hash_destroy (h, destroy_page);
+	struct page_struct *p = (struct page_struct*) malloc(
+			sizeof(struct page_struct));
+	if (p != NULL)
+	{
+		//common data for both the types
+		p->virtual_address = virt_address;
+		p->physical_address = NULL;
+		p->writable = writable;
+		p->loaded = false;
+		p->index = 0;
+		p->pagedir = thread_current()->pagedir;
+	}
+	if (type == TYPE_ZERO)
+	{
+
+		if (p != NULL)
+		{
+			p->type = TYPE_ZERO;
+
+			pagedir_op_page(p->pagedir, p->virtual_address, (void *) p);
+
+			return p;
+		}
+	}
+	else if (type == TYPE_FILE)
+	{
+		if (p != NULL)
+		{
+			p->type = TYPE_FILE;
+			p->file = file;
+			p->offset = ofs;
+			p->read_bytes = read_bytes;
+			p->zero_bytes = zero_bytes;
+			p->bid = block_id;
+
+			pagedir_op_page(p->pagedir, p->virtual_address, (void *) p);
+
+			return p;
+		}
+	}
+	return NULL;
 }
 
-/* Returns the page containing the given virtual ADDRESS,
-   or a null pointer if no such page exists.
-   Allocates stack pages as necessary. */
-static struct page *
-page_for_addr (const void *address)
+//setting the operation to true pins the page
+//returns true if the operation is successful
+//directFrameAccess allows you to pin the frame
+bool VM_pin(bool operation, void *pagetemp, bool directFrameAccess)
 {
-  if (address < PHYS_BASE)
-    {
-      struct page p;
-      struct hash_elem *e;
-
-      /* Find existing page. */
-      p.addr = (void *) pg_round_down (address);
-      e = hash_find (thread_current ()->pages, &p.hash_elem);
-      if (e != NULL)
-        return hash_entry (e, struct page, hash_elem);
-
-      /* -We need to determine if the program is attempting to access the stack.
-         -First, we ensure that the address is not beyond the bounds of the stack space (1 MB in this
-          case).
-         -As long as the user is attempting to acsess an address within 32 bytes (determined by the space
-          needed for a PUSHA command) of the stack pointers, we assume that the address is valid. In that
-          case, we should allocate one more stack page accordingly.
-      */
-      if ((p.addr > PHYS_BASE - STACK_MAX) && ((void *)thread_current()->user_esp - 32 < address))
-      {
-        return page_allocate (p.addr, false);
-      }
-    }
-
-  return NULL;
+	struct page_struct *page = (struct page_struct *) pagetemp;
+	void * address = page->physical_address;
+	if (directFrameAccess)
+		address = pagetemp;
+	if (page->physical_address == NULL || directFrameAccess)
+	{
+		struct frame_struct *f = address_to_frame(address);
+		if (f != NULL)
+		{
+			switch (operation)
+			{
+			case true:
+				f->persistent = true;
+				return true;
+				break;
+			case false:
+				f->persistent = false;
+				return true;
+				break;
+			default:
+				return false;
+			}
+		}
+	}
+	return false;
 }
 
-/* Locks a frame for page P and pages it in.
-   Returns true if successful, false on failure. */
-static bool
-do_page_in (struct page *p)
+bool VM_operation_page(int operation, void *address, void * kpage, bool pinned)
 {
-  /* Get a frame for the page. */
-  p->frame = frame_alloc_and_lock (p);
-  if (p->frame == NULL)
-    return false;
+	//performs load operation
+	if (operation == OP_LOAD)
+	{
+		lock_acquire(&l[LOCK_LOAD]);
 
-  /* Copy data into the frame. */
-  if (p->sector != (block_sector_t) -1)
-    {
-      /* Get data from swap. */
-      swap_in (p);
-    }
-  else if (p->file != NULL)
-    {
-      /* Get data from file. */
-      off_t read_bytes = file_read_at (p->file, p->frame->base,
-                                        p->file_bytes, p->file_offset);
-      off_t zero_bytes = PGSIZE - read_bytes;
-      memset (p->frame->base + read_bytes, 0, zero_bytes);
-      if (read_bytes != p->file_bytes)
-        printf ("bytes read (%"PROTd") != bytes requested (%"PROTd")\n",
-                read_bytes, p->file_bytes);
-    }
-  else
-    {
-      /* Provide all-zero page. */
-      memset (p->frame->base, 0, PGSIZE);
-    }
+		struct page_struct *page = (struct page_struct *) address;
 
-  return true;
+		//get empty frame
+		if (page->physical_address == NULL)
+			page->physical_address = VM_get_frame(NULL, NULL, PAL_USER);
+
+		lock_release(&l[LOCK_LOAD]);
+
+		//creates mapping from page to frame
+		struct frame_struct *vf = address_to_frame(page->physical_address);
+		if (vf == NULL)
+			return false;
+		lock_acquire(&vf->page_list_lock);
+		list_push_back(&vf->shared_pages, &page->frame_elem);
+		lock_release(&vf->page_list_lock);
+
+		bool success = true;
+
+		if (page->type == TYPE_FILE)
+		{
+			lock_acquire(&file_lock);
+			file_seek(page->file, page->offset);
+			size_t ret = file_read(page->file, page->physical_address,
+					page->read_bytes);
+			lock_release(&file_lock);
+
+			if (ret != page->read_bytes)
+			{
+				VM_free_frame(page->physical_address, page->pagedir);
+				success = false;
+			}
+			else
+			{
+				void *block = page->physical_address + page->read_bytes;
+				memset(block, 0, page->zero_bytes);
+				success = true;
+			}
+		}
+		else if (page->type == TYPE_ZERO)
+			memset(page->physical_address, 0, PGSIZE);
+		else
+		{
+			//Load a page to main memory from the swap area
+			size_t i = page->index;
+			void *address = page->physical_address;
+			size_t offset = 0;
+			int blocks_in_one_page = PGSIZE / BLOCK_SECTOR_SIZE;
+
+			lock_acquire(&l[LOCK_SWAP]);
+			while (offset < blocks_in_one_page)
+			{
+				if (bitmap_test(swap_bitmap, i) && i < swap_size)
+				{
+					void *buffer = address + offset * BLOCK_SECTOR_SIZE;
+					block_read(swap_block, i, buffer);
+				}
+				else
+					PANIC("Problem when loading a page from swap to main mem");
+
+				i++;
+				offset++;
+			}
+
+			//Free the swap frame
+			offset = 0;
+			i = page->index;
+			while (offset < blocks_in_one_page)
+			{
+				if (bitmap_test(swap_bitmap, i) && i < swap_size)
+					bitmap_reset(swap_bitmap, i);
+				else
+					PANIC("Problem when freeing swap -- OP_FREE");
+
+				i++;
+				offset++;
+			}
+			lock_release(&l[LOCK_SWAP]);
+		}
+
+		if (!success)
+		{
+			VM_pin(false, page->physical_address, true);
+			return false;
+		}
+
+		pagedir_clear_page(page->pagedir, page->virtual_address);
+		bool s = pagedir_set_page(page->pagedir, page->virtual_address,
+				page->physical_address, page->writable);
+		if (!s)
+		{
+			ASSERT(false);
+			VM_pin(false, page->physical_address, true);
+			return false;
+		}
+
+		pagedir_set_dirty(page->pagedir, page->virtual_address, false);
+		pagedir_set_accessed(page->pagedir, page->virtual_address, true);
+
+		page->loaded = true;
+		if (!pinned)
+			VM_pin(false, page->physical_address, true);
+		return true;
+	}
+	else if (operation == OP_UNLOAD)
+	{
+		struct page_struct *page = (struct page_struct *) address;
+		lock_acquire(&l[LOCK_UNLOAD]);
+		if (page->type == TYPE_FILE
+				&& pagedir_is_dirty(page->pagedir, page->virtual_address)
+				&& !file_check_write(page->file))
+		{
+			VM_pin(true, kpage, true);
+			lock_acquire(&file_lock);
+
+			file_seek(page->file, page->offset);
+			file_write(page->file, kpage, page->read_bytes);
+			lock_release(&file_lock);
+			VM_pin(false, kpage, true);
+		}
+		else if (page->type == TYPE_SWAP
+				|| pagedir_is_dirty(page->pagedir, page->virtual_address))
+		{
+			//store the current page to swap
+			page->type = TYPE_SWAP;
+
+			//move swap from main memory to swap
+			void * addr = kpage;
+			int blocks_in_one_page = PGSIZE / BLOCK_SECTOR_SIZE;
+			lock_acquire(&l[LOCK_SWAP]);
+			size_t index = bitmap_scan_and_flip(swap_bitmap, 0,
+					blocks_in_one_page,
+					false);
+
+			if (index != BITMAP_ERROR)
+			{
+				size_t offset = 0;
+				size_t i = index;
+				while (offset < blocks_in_one_page)
+				{
+					if (bitmap_test(swap_bitmap, i) && (index < swap_size))
+					{
+						block_write(swap_block, i,
+								addr + offset * BLOCK_SECTOR_SIZE);
+						i++;
+						offset++;
+					}
+					else
+						PANIC("Problem when moving a page from memory to swap");
+				}
+			}
+			else
+			{
+				PANIC(
+						"Problem when moving a page from memory to swap -- index");
+			}
+			lock_release(&l[LOCK_SWAP]);
+
+			page->index = index;
+		}
+		lock_release(&l[LOCK_UNLOAD]);
+
+		pagedir_clear_page(page->pagedir, page->virtual_address);
+		pagedir_op_page(page->pagedir, page->virtual_address, (void *) page);
+		page->loaded = false;
+		page->physical_address = NULL;
+	}
+	else if (operation == OP_FIND)
+	{
+		//cannot be done here because of incomparable return type
+	}
+	else if (operation == OP_FREE)
+	{
+		struct page_struct *page = (struct page_struct *) address;
+		if (page == NULL)
+			return false;
+
+		//free swap data
+		if (page->type == TYPE_SWAP && !page->loaded)
+		{
+			size_t offset = 0;
+			size_t i = page->index;
+			int blocks_in_one_page = PGSIZE / BLOCK_SECTOR_SIZE;
+			lock_acquire(&l[LOCK_SWAP]);
+			while (offset < blocks_in_one_page)
+			{
+
+				if (bitmap_test(swap_bitmap, i) && i < swap_size)
+					bitmap_reset(swap_bitmap, i);
+				else
+					PANIC("Problem when freeing swap -- OP_FREE");
+
+				i++;
+				offset++;
+			}
+			lock_release(&l[LOCK_SWAP]);
+		}
+
+		//clear mappings from thread's pagedir
+		pagedir_clear_page(page->pagedir, page->virtual_address);
+		free(page);
+		return true;
+	}
+	else
+	{
+		return false;
+	}
+	return false;
 }
 
-/* Faults in the page containing FAULT_ADDR.
-   Returns true if successful, false on failure. */
-bool
-page_in (void *fault_addr)
+struct page_struct *VM_stack_grow(void *address, bool pin)
 {
-  struct page *p;
-  bool success;
-
-  /* Can't handle page faults without a hash table. */
-  if (thread_current ()->pages == NULL)
-    return false;
-
-  p = page_for_addr (fault_addr);
-  if (p == NULL)
-    return false;
-
-  frame_lock (p);
-  if (p->frame == NULL)
-    {
-      if (!do_page_in (p))
-        return false;
-    }
-  ASSERT (lock_held_by_current_thread (&p->frame->lock));
-
-  /* Install frame into page table. */
-  success = pagedir_set_page (thread_current ()->pagedir, p->addr,
-                              p->frame->base, !p->read_only);
-
-  /* Release frame. */
-  frame_unlock (p->frame);
-
-  return success;
+	struct page_struct *page = NULL;
+	page = VM_new_page(TYPE_ZERO, address, true, NULL,
+	NULL, NULL, NULL, NULL);
+	if (page != NULL)
+	{
+		bool success = VM_operation_page(OP_LOAD, page, page->physical_address,
+				pin);
+		if (success)
+			return page;
+		else
+			return NULL;
+	}
+	return NULL;
 }
 
-/* Evicts page P.
-   P must have a locked frame.
-   Return true if successful, false on failure. */
-bool
-page_out (struct page *p)
+struct page_struct *VM_find_page(void *address)
 {
-  bool dirty;
-  bool ok = false;
+	uint32_t *pagedir = NULL;
+	pagedir = thread_current()->pagedir;
+	if (pagedir != NULL)
+	{
+		struct page_struct *page = NULL;
 
-  ASSERT (p->frame != NULL);
-  ASSERT (lock_held_by_current_thread (&p->frame->lock));
+		page = (struct page_struct *) pagedir_op_page(pagedir,
+				(const void *) address, NULL);
 
-  /* Mark page not present in page table, forcing accesses by the
-     process to fault.  This must happen before checking the
-     dirty bit, to prevent a race with the process dirtying the
-     page. */
-  pagedir_clear_page(p->thread->pagedir, (void *) p->addr);
-
-  /* Has the frame been modified? */
-  /* If the frame has been modified, set 'dirty' to true. */
-  dirty = pagedir_is_dirty (p->thread->pagedir, (const void *) p->addr);
-
-  /* If the frame is not dirty (and file != NULL), we have sucsessfully evicted the page. */
-  if(!dirty)
-  {
-    ok = true;
-  }
-  
-  /* If the file is null, we definitely don't want to write the frame to disk. We must swap out the
-     frame and save whether or not the swap was successful. This could overwrite the previous value of
-     'ok'. */
-  if (p->file == NULL)
-  {
-    ok = swap_out(p);
-  }
-  /* Otherwise, a file exists for this page. If file contents have been modified, then they must be
-     be written back to the file system on disk, or swapped out. This is determined by the private
-     variable associated with the page. */
-  else
-  {
-    if (dirty)
-    {
-      if(p->private)
-      {
-        ok = swap_out(p);
-      }
-      else
-      {
-        ok = file_write_at(p->file, (const void *) p->frame->base, p->file_bytes, p->file_offset);
-      }
-    }
-  }
-
-  /* Nullify the frame held by the page. */
-  if(ok)
-  {
-    p->frame = NULL;
-  }
-  return ok;
+		return page;
+	}
+	return NULL;
 }
 
-/* Returns true if page P's data has been accessed recently,
-   false otherwise.
-   P must have a frame locked into memory. */
-bool
-page_accessed_recently (struct page *p)
+unsigned frame_hash(const struct hash_elem *f_, void *aux UNUSED)
 {
-  bool was_accessed;
-
-  ASSERT (p->frame != NULL);
-  ASSERT (lock_held_by_current_thread (&p->frame->lock));
-
-  was_accessed = pagedir_is_accessed (p->thread->pagedir, p->addr);
-  if (was_accessed)
-    pagedir_set_accessed (p->thread->pagedir, p->addr, false);
-  return was_accessed;
+	const struct frame_struct *f = hash_entry(f_, struct frame_struct,
+			hash_elem);
+	return hash_int((unsigned) f->physical_address);
 }
 
-/* Adds a mapping for user virtual address VADDR to the page hash
-   table.  Fails if VADDR is already mapped or if memory
-   allocation fails. */
-struct page *
-page_allocate (void *vaddr, bool read_only)
+bool frame_less_helper(const struct hash_elem *a_, const struct hash_elem *b_,
+		void *aux UNUSED)
 {
-  struct thread *t = thread_current ();
-  struct page *p = malloc (sizeof *p);
-  if (p != NULL)
-    {
-      p->addr = pg_round_down (vaddr);
+	const struct frame_struct *a = hash_entry(a_, struct frame_struct,
+			hash_elem);
+	const struct frame_struct *b = hash_entry(b_, struct frame_struct,
+			hash_elem);
 
-      p->read_only = read_only;
-      p->private = !read_only;
-
-      p->frame = NULL;
-
-      p->sector = (block_sector_t) -1;
-
-      p->file = NULL;
-      p->file_offset = 0;
-      p->file_bytes = 0;
-
-      p->thread = thread_current ();
-
-      if (hash_insert (t->pages, &p->hash_elem) != NULL)
-        {
-          /* Already mapped. */
-          free (p);
-          p = NULL;
-        }
-    }
-  return p;
+	return a->physical_address < b->physical_address;
 }
 
-/* Evicts the page containing address VADDR
-   and removes it from the page table. */
-void
-page_deallocate (void *vaddr)
+unsigned mmap_hash(const struct hash_elem *mf_, void *aux UNUSED)
 {
-  struct page *p = page_for_addr (vaddr);
-  ASSERT (p != NULL);
-  frame_lock (p);
-  if (p->frame)
-    {
-      struct frame *f = p->frame;
-      if (p->file && !p->private)
-        page_out (p);
-      frame_free (f);
-    }
-  hash_delete (thread_current ()->pages, &p->hash_elem);
-  free (p);
+	const struct mmap_struct *mf = hash_entry(mf_, struct mmap_struct,
+			frame_hash_elem);
+	return hash_int((unsigned) mf->mapid);
 }
 
-/* Returns a hash value for the page that E refers to. */
-unsigned
-page_hash (const struct hash_elem *e, void *aux UNUSED)
+bool mmap_less_helper(const struct hash_elem *a_, const struct hash_elem *b_,
+		void *aux UNUSED)
 {
-  const struct page *p = hash_entry (e, struct page, hash_elem);
-  return ((uintptr_t) p->addr) >> PGBITS;
-}
+	const struct mmap_struct *a = hash_entry(a_, struct mmap_struct,
+			frame_hash_elem);
+	const struct mmap_struct *b = hash_entry(b_, struct mmap_struct,
+			frame_hash_elem);
 
-/* Returns true if page A precedes page B. */
-bool
-page_less (const struct hash_elem *a_, const struct hash_elem *b_,
-           void *aux UNUSED)
-{
-  const struct page *a = hash_entry (a_, struct page, hash_elem);
-  const struct page *b = hash_entry (b_, struct page, hash_elem);
-
-  return a->addr < b->addr;
-}
-
-/* Tries to lock the page containing ADDR into physical memory.
-   If WILL_WRITE is true, the page must be writeable;
-   otherwise it may be read-only.
-   Returns true if successful, false on failure. */
-bool
-page_lock (const void *addr, bool will_write)
-{
-  struct page *p = page_for_addr (addr);
-  if (p == NULL || (p->read_only && will_write))
-    return false;
-
-  frame_lock (p);
-  if (p->frame == NULL)
-    return (do_page_in (p)
-            && pagedir_set_page (thread_current ()->pagedir, p->addr,
-                                 p->frame->base, !p->read_only));
-  else
-    return true;
-}
-
-/* Unlocks a page locked with page_lock(). */
-void
-page_unlock (const void *addr)
-{
-  struct page *p = page_for_addr (addr);
-  ASSERT (p != NULL);
-  frame_unlock (p->frame);
+	return a->mapid < b->mapid;
 }

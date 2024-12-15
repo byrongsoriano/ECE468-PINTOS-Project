@@ -1,162 +1,195 @@
-#include "vm/frame.h"
-#include <stdio.h>
-#include "vm/page.h"
-#include "devices/timer.h"
-#include "threads/init.h"
-#include "threads/malloc.h"
-#include "threads/palloc.h"
-#include "threads/synch.h"
-#include "threads/vaddr.h"
+#include "vm/struct.h"
 
-static struct frame *frames;
-static size_t frame_cnt;
-
-static struct lock scan_lock;
-static size_t hand;
-
-/* Initialize the frame manager. */
-void
-frame_init (void) 
+void *VM_get_frame(void *frame, uint32_t *pagedir, enum palloc_flags flags)
 {
-  void *base;
+	//decide based on parameters
+	if (frame == NULL)
+	{
+		struct frame_struct *vf = NULL;
+		void *address = palloc_get_page(flags);
 
-  lock_init (&scan_lock);
-  
-  frames = malloc (sizeof *frames * init_ram_pages);
-  if (frames == NULL)
-    PANIC ("out of memory allocating page frames");
+		//if allocation was unsuccessful
+		if (address == NULL)
+		{
+			evict();
+			return VM_get_frame(NULL, NULL, flags);
+		}
 
-  while ((base = palloc_get_page (PAL_USER)) != NULL) 
-    {
-      struct frame *f = &frames[frame_cnt++];
-      lock_init (&f->lock);
-      f->base = base;
-      f->page = NULL;
-    }
+		//otherwise, proceed
+		vf = (struct frame_struct *) malloc(sizeof(struct frame_struct));
+		if (vf != NULL)
+		{
+			vf->physical_address = address;
+			vf->persistent = true;
+			list_init(&vf->shared_pages);
+			lock_init(&vf->page_list_lock);
+
+			lock_acquire(&l[LOCK_FRAME]);
+			list_push_front(&hash_frame_list, &vf->frame_list_elem);
+			hash_insert(&hash_frame, &vf->hash_elem);
+			lock_release(&l[LOCK_FRAME]);
+		}
+		return address;
+	}
+	else
+	{
+		struct frame_struct *vf = NULL;
+		struct page_struct *page = NULL;
+		struct list_elem *elem;
+
+		vf = address_to_frame(frame);
+		if (vf != NULL)
+		{
+			lock_acquire(&vf->page_list_lock);
+			elem = list_begin(&vf->shared_pages);
+			while (elem != list_end(&vf->shared_pages))
+			{
+				page = list_entry(elem, struct page_struct, frame_elem);
+				if (page->pagedir != pagedir)
+				{
+					elem = list_next(elem);
+					continue;
+				}
+				break;
+			}
+			lock_release(&vf->page_list_lock);
+		}
+		return page;
+	}
+
 }
 
-/* Tries to allocate and lock a frame for PAGE.
-   Returns the frame if successful, false on failure. */
-static struct frame *
-try_frame_alloc_and_lock (struct page *page) 
+//frees frame and writes data to swap
+void VM_free_frame(void *address, uint32_t *pagedir)
 {
-  size_t i;
+	lock_acquire(&l[LOCK_EVICT]);
+	struct frame_struct *vf = NULL;
+	struct page_struct *page = NULL;
+	struct list_elem *e;
 
-  lock_acquire (&scan_lock);
+	vf = address_to_frame(address);
+	if (vf == NULL)
+	{
+		lock_release(&l[LOCK_EVICT]);
+		return;
+	}
 
-  /* Find a free frame. */
-  for (i = 0; i < frame_cnt; i++)
-    {
-      struct frame *f = &frames[i];
-      if (!lock_try_acquire (&f->lock))
-        continue;
-      if (f->page == NULL) 
-        {
-          f->page = page;
-          lock_release (&scan_lock);
-          return f;
-        } 
-      lock_release (&f->lock);
-    }
+	if (pagedir == NULL)
+	{
 
-  /* No free frame.  Find a frame to evict. */
-  for (i = 0; i < frame_cnt * 2; i++) 
-    {
-      /* Get a frame. */
-      struct frame *f = &frames[hand];
-      if (++hand >= frame_cnt)
-        hand = 0;
+		lock_acquire(&vf->page_list_lock);
+		while (true)
+		{
+			if (list_empty(&vf->shared_pages))
+				break;
+			e = list_begin(&vf->shared_pages);
+			page = list_entry(e, struct page_struct, frame_elem);
+			list_remove(&page->frame_elem);
+			VM_operation_page(OP_UNLOAD, page, vf->physical_address, false);
+		}
+		lock_release(&vf->page_list_lock);
+	}
+	else
+	{
 
-      if (!lock_try_acquire (&f->lock))
-        continue;
+		page = VM_get_frame(address, pagedir, PAL_USER);
 
-      if (f->page == NULL) 
-        {
-          f->page = page;
-          lock_release (&scan_lock);
-          return f;
-        } 
+		if (page != NULL)
+		{
+			lock_acquire(&vf->page_list_lock);
+			list_remove(&page->frame_elem);
+			lock_release(&vf->page_list_lock);
+			VM_operation_page(OP_UNLOAD, page, vf->physical_address, false);
+		}
+	}
 
-      if (page_accessed_recently (f->page)) 
-        {
-          lock_release (&f->lock);
-          continue;
-        }
-          
-      lock_release (&scan_lock);
-      
-      /* Evict this frame. */
-      if (!page_out (f->page))
-        {
-          lock_release (&f->lock);
-          return NULL;
-        }
+	if (!list_empty(&vf->shared_pages))
+	{
+		lock_release(&l[LOCK_EVICT]);
+		return;
+	}
 
-      f->page = page;
-      return f;
-    }
+	lock_acquire(&l[LOCK_FRAME]);
+	hash_delete(&hash_frame, &vf->hash_elem);
+	list_remove(&vf->frame_list_elem);
+	free(vf);
+	lock_release(&l[LOCK_FRAME]);
+	palloc_free_page(address);
 
-  lock_release (&scan_lock);
-  return NULL;
+	lock_release(&l[LOCK_EVICT]);
 }
 
-
-/* Tries really hard to allocate and lock a frame for PAGE.
-   Returns the frame if successful, false on failure. */
-struct frame *
-frame_alloc_and_lock (struct page *page) 
+bool eviction_clock(struct frame_struct *f)
 {
-  size_t try;
-
-  for (try = 0; try < 3; try++) 
-    {
-      struct frame *f = try_frame_alloc_and_lock (page);
-      if (f != NULL) 
-        {
-          ASSERT (lock_held_by_current_thread (&f->lock));
-          return f; 
-        }
-      timer_msleep (1000);
-    }
-
-  return NULL;
+	struct list_elem *ele = list_begin(&f->shared_pages);
+	while (ele != list_end(&f->shared_pages))
+	{
+		struct page_struct *page = list_entry(ele, struct page_struct,
+				frame_elem);
+		if (page != NULL)
+			if (pagedir_is_accessed(page->pagedir, page->virtual_address))
+			{
+				pagedir_set_accessed(page->pagedir, page->virtual_address,
+				false);
+				return false;
+			}
+		ele = list_next(ele);
+	}
+	return true;
 }
 
-/* Locks P's frame into memory, if it has one.
-   Upon return, p->frame will not change until P is unlocked. */
-void
-frame_lock (struct page *p) 
+void evict()
 {
-  /* A frame can be asynchronously removed, but never inserted. */
-  struct frame *f = p->frame;
-  if (f != NULL) 
-    {
-      lock_acquire (&f->lock);
-      if (f != p->frame)
-        {
-          lock_release (&f->lock);
-          ASSERT (p->frame == NULL); 
-        } 
-    }
+	lock_acquire(&l[LOCK_EVICT]);
+	lock_acquire(&l[LOCK_FRAME]);
+	struct frame_struct *frame_to_evict = NULL;
+	struct list_elem *e = list_end(&hash_frame_list);
+	struct frame_struct *cur_frame = list_entry(e, struct frame_struct,
+			frame_list_elem);
+
+	while (true)
+	{
+		//printf("stuck in while loop");
+		cur_frame = list_entry(e, struct frame_struct, frame_list_elem);
+		if (cur_frame == NULL)
+			PANIC("Something wrong with eviction");
+
+		if (cur_frame->persistent == true || !eviction_clock(cur_frame))
+		{
+			if (e == NULL || e == list_begin(&hash_frame_list))
+				e = list_end(&hash_frame_list);
+			else
+				e = list_prev(e);
+			continue;
+		}
+
+		frame_to_evict = cur_frame;
+		break;
+	}
+
+	lock_release(&l[LOCK_FRAME]);
+	lock_release(&l[LOCK_EVICT]);
+	VM_free_frame(frame_to_evict->physical_address, NULL);
 }
 
-/* Releases frame F for use by another page.
-   F must be locked for use by the current process.
-   Any data in F is lost. */
-void
-frame_free (struct frame *f)
+struct frame_struct *address_to_frame(void *address)
 {
-  ASSERT (lock_held_by_current_thread (&f->lock));
-          
-  f->page = NULL;
-  lock_release (&f->lock);
-}
+	struct frame_struct f;
+	f.physical_address = address;
 
-/* Unlocks frame F, allowing it to be evicted.
-   F must be locked for use by the current process. */
-void
-frame_unlock (struct frame *f) 
-{
-  ASSERT (lock_held_by_current_thread (&f->lock));
-  lock_release (&f->lock);
+	if (f.physical_address != NULL)
+	{
+		lock_acquire(&l[LOCK_FRAME]);
+		struct hash_elem *e;
+		e = hash_find(&hash_frame, &f.hash_elem);
+		lock_release(&l[LOCK_FRAME]);
+		if (e == NULL)
+			return NULL;
+		else
+		{
+			e = hash_entry(e, struct frame_struct, hash_elem);
+			return e;
+		}
+	}
+	return NULL;
 }
